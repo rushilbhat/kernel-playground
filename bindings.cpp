@@ -2,7 +2,7 @@
 
 #ifdef COMPILE_MATMUL_BIAS_RELU
 torch::Tensor matmul_bias_relu(
-    torch::Tensor A, torch::Tensor B, torch::Tensor bias
+    torch::Tensor a, torch::Tensor b, torch::Tensor bias
 );
 #endif
 

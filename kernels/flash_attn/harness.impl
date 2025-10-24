@@ -1,0 +1,131 @@
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+
+
+constexpr int BATCH_SIZE = 12;
+constexpr int N_HEADS = 12;
+constexpr int SEQ_LEN = 1024;
+constexpr int HEAD_DIM = 64;
+
+void check_correctness(const float *computed, const float *reference, int num_elements, const char *name){
+    float max_error = 0.0f;
+    int error_count = 0;
+    for (int i = 0; i < num_elements; i++){
+        float error = std::abs(computed[i] - reference[i]);
+        if (error > 1.0){
+            error_count++;
+        }
+        max_error = std::max(max_error, error);
+    }
+
+    std::cout << "Verifying " << name << " tensor" << std::endl;
+    std::cout << "Total elements: " << num_elements << std::endl;
+    std::cout << "Max error: " << max_error << std::endl;
+    std::cout << "Error count: " << error_count << std::endl;
+
+}
+
+
+int main(int argc, char **argv) {
+constexpr int TOTAL_ELEMENTS = BATCH_SIZE * N_HEADS * SEQ_LEN * HEAD_DIM;
+
+float *h_q     = new float[TOTAL_ELEMENTS];
+float *h_k     = new float[TOTAL_ELEMENTS];
+float *h_v     = new float[TOTAL_ELEMENTS];
+float *h_o     = new float[TOTAL_ELEMENTS];
+float *h_l     = new float[TOTAL_ELEMENTS / HEAD_DIM];
+float *h_o_ref = new float[TOTAL_ELEMENTS];
+float *h_l_ref = new float[TOTAL_ELEMENTS / HEAD_DIM];
+
+std::ifstream infile({argv[1]});
+
+for(int i = 0; i < TOTAL_ELEMENTS; i++) infile >> h_q[i];
+for(int i = 0; i < TOTAL_ELEMENTS; i++) infile >> h_k[i];
+for(int i = 0; i < TOTAL_ELEMENTS; i++) infile >> h_v[i];
+for(int i = 0; i < TOTAL_ELEMENTS; i++) infile >> h_o_ref[i];
+for(int i = 0; i < TOTAL_ELEMENTS / HEAD_DIM; i++) infile >> h_l_ref[i];
+
+#ifndef NDEBUG
+for (int b = 0; b < BATCH_SIZE; b++){
+    for (int h = 0; h < N_HEADS; h++){
+        std::cout << "Batch " << b << ", Head " << h << "\n";
+        for (int s = 0; s < SEQ_LEN; s++){
+            for (int d = 0; d < HEAD_DIM; d++){
+                const int idx = b*N_HEADS*SEQ_LEN*HEAD_DIM + h*SEQ_LEN*HEAD_DIM + s*HEAD_DIM + d;
+                std::cout << std::setw(10) << h_q[idx] << " ";
+            }
+            std::cout << "\n";
+        }
+        std::cout << "\n";
+    }
+}
+return 0;
+#endif
+
+__nv_bfloat16 *h_q_bf = new __nv_bfloat16[TOTAL_ELEMENTS];
+__nv_bfloat16 *h_k_bf = new __nv_bfloat16[TOTAL_ELEMENTS];
+__nv_bfloat16 *h_v_bf = new __nv_bfloat16[TOTAL_ELEMENTS];
+
+for(int i = 0; i < TOTAL_ELEMENTS; i++) {
+    h_q_bf[i] = __float2bfloat16(h_q[i]);
+    h_k_bf[i] = __float2bfloat16(h_k[i]);
+    h_v_bf[i] = __float2bfloat16(h_v[i]);
+}
+
+__nv_bfloat16 *d_q, *d_k, *d_v, *d_o;
+cudaMalloc(&d_q, TOTAL_ELEMENTS * sizeof(__nv_bfloat16));
+cudaMalloc(&d_k, TOTAL_ELEMENTS * sizeof(__nv_bfloat16));
+cudaMalloc(&d_v, TOTAL_ELEMENTS * sizeof(__nv_bfloat16));
+cudaMalloc(&d_o, TOTAL_ELEMENTS * sizeof(__nv_bfloat16));
+
+float *d_l;
+cudaMalloc(&d_l, (TOTAL_ELEMENTS / HEAD_DIM) * sizeof(float));
+
+cudaMemcpy(d_q, h_q_bf, TOTAL_ELEMENTS * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+cudaMemcpy(d_k, h_k_bf, TOTAL_ELEMENTS * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+cudaMemcpy(d_v, h_v_bf, TOTAL_ELEMENTS * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+
+fwd_globals<64> globals{
+    {d_q, static_cast<unsigned int>(BATCH_SIZE), static_cast<unsigned int>(N_HEADS), static_cast<unsigned int>(SEQ_LEN), nullptr},
+    {d_k, static_cast<unsigned int>(BATCH_SIZE), static_cast<unsigned int>(N_HEADS), static_cast<unsigned int>(SEQ_LEN), nullptr},
+    {d_v, static_cast<unsigned int>(BATCH_SIZE), static_cast<unsigned int>(N_HEADS), static_cast<unsigned int>(SEQ_LEN), nullptr},
+    {d_o, static_cast<unsigned int>(BATCH_SIZE), static_cast<unsigned int>(N_HEADS), static_cast<unsigned int>(SEQ_LEN), nullptr},
+    {d_l, static_cast<unsigned int>(BATCH_SIZE), static_cast<unsigned int>(N_HEADS), nullptr, static_cast<unsigned int>(SEQ_LEN)}
+};
+
+dim3 grid(114);
+dim3 block(NUM_WARPGROUPS*WARPGROUP_THREADS);
+
+unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
+cudaFuncSetAttribute(fwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+
+fwd_kernel<<<grid, block, mem_size>>>(globals);
+
+__nv_bfloat16 *h_o_bf = new __nv_bfloat16[TOTAL_ELEMENTS];
+cudaMemcpy(h_o_bf, d_o, TOTAL_ELEMENTS * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+cudaMemcpy(h_l, d_l, (TOTAL_ELEMENTS / HEAD_DIM) * sizeof(float), cudaMemcpyDeviceToHost);
+for (int i = 0; i < TOTAL_ELEMENTS; i++) h_o[i] = __bfloat162float(h_o_bf[i]);
+
+check_correctness(h_o, h_o_ref, TOTAL_ELEMENTS, "O");
+check_correctness(h_l, h_l_ref, TOTAL_ELEMENTS / HEAD_DIM, "L");
+
+delete[] h_q;
+delete[] h_k;
+delete[] h_v;
+delete[] h_o;
+delete[] h_l;
+delete[] h_o_ref;
+delete[] h_l_ref;
+delete[] h_q_bf;
+delete[] h_k_bf;
+delete[] h_v_bf;
+delete[] h_o_bf;
+cudaFree(d_q);
+cudaFree(d_k);
+cudaFree(d_v);
+cudaFree(d_o);
+cudaFree(d_l);
+
+return 0;
+}

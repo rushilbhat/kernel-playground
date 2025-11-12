@@ -32,13 +32,13 @@ with open(fn, 'w') as f:
     k_out = k.float().flatten().detach().cpu().numpy().tolist()
     v_out = v.float().flatten().detach().cpu().numpy().tolist()
     o_out = o.float().flatten().detach().cpu().numpy().tolist()
-    import pandas as pd
-    for k in range(batch_size):
-        for j in range(n_heads):
-            for i in range(seq_len//head_dim):
+    # import pandas as pd
+    # for k in range(batch_size):
+    #     for j in range(n_heads):
+    #         for i in range(seq_len//head_dim):
                 # print(f"CTA {k*n_heads*seq_len/head_dim + j*seq_len//head_dim + i//2}, CWG {i%2}")
-                print(f"batch {k}, head {j}, seq {i}")
-                print(pd.DataFrame(o[k, j, (64*i):(64*(i+1)), :].float().cpu().numpy()))
+                # print(f"batch {k}, head {j}, seq {i}")
+                # print(pd.DataFrame(o[k, j, (64*i):(64*(i+1)), :].float().cpu().numpy()))
 
     l_out = l.flatten().detach().cpu().numpy().tolist()
 

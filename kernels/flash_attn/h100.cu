@@ -9,6 +9,9 @@ constexpr int KV_CHUNK = 64;
 
 constexpr int NUM_STAGES = 2;
 
+constexpr int DEBUG_BLK_ID = 0;
+constexpr int DEBUG_CWG_ID = 0;
+
 using namespace kittens;
 
 template<int HEAD_DIM> struct fwd_globals {
@@ -37,7 +40,7 @@ __device__ static inline int4 get_task_coord(fwd_globals<64> globals, int task_i
     int batch = task_id / (chunked_seqlen * globals.q.depth());
 
     if (batch < globals.q.batch()){
-        return {batch, depth, row * CONSUMER_WARPGROUPS + (is_consumer ? warpgroup::groupid() : 0), 0};
+        return {batch, depth, row * CONSUMER_WARPGROUPS, 0};
     }
     else {
         return {-1, -1, -1, -1};
@@ -59,6 +62,23 @@ __device__ static inline void print_coords_debug(int task_iter, int4 coord) {
     }
 }
 
+template <typename Tile>
+__device__ static inline void debug_print_tile(int block_id, int warpgroup_id, const Tile &tile) {
+    if (blockIdx.x == block_id && warpgroup::groupid() == warpgroup_id && warpgroup::warpid() == 1) {
+        print(tile);
+    }
+}
+
+__device__ static inline unsigned get_phase_bit(uint32_t bitfield, int stage) {
+    return (bitfield >> stage) & 1u;
+}
+
+__device__ static inline void update_phase_bit(uint32_t &bitfield, int stage) {
+    bitfield ^= (1u << stage);
+}
+
+
+template<bool is_causal>
 __global__ __launch_bounds__(NUM_WARPGROUPS*WARPGROUP_THREADS, 1)
 void fwd_kernel(const __grid_constant__ fwd_globals<64> globals) {
     extern __shared__ int __shm[];
@@ -75,12 +95,12 @@ void fwd_kernel(const __grid_constant__ fwd_globals<64> globals) {
     kv_tile (&v_smem) [NUM_STAGES]          = al.allocate<kv_tile, NUM_STAGES>();
     l_vec   (&l_smem) [CONSUMER_WARPGROUPS] = al.allocate<l_vec,   CONSUMER_WARPGROUPS>();
     qo_tile (*o_smem) = &q_smem[0];
+    using attn_tile = st_bf<QO_CHUNK, KV_CHUNK>;
+    attn_tile (&debug_masking_smem) [CONSUMER_WARPGROUPS] = al.allocate<attn_tile, CONSUMER_WARPGROUPS>();
 
     __shared__ kittens::semaphore q_tiles_ready, o_tiles_flushed;
     __shared__ kittens::semaphore k_stage_arrived[NUM_STAGES], k_stage_finished[NUM_STAGES];
     __shared__ kittens::semaphore v_stage_arrived[NUM_STAGES], v_stage_finished[NUM_STAGES];
-    
-    uint32_t semaphore_bitfield = 0xFFFF0000;
 
     if (warpgroup::groupid() >= CONSUMER_WARPGROUPS){
         if (warpgroup::warpid() == 0){
@@ -98,32 +118,51 @@ void fwd_kernel(const __grid_constant__ fwd_globals<64> globals) {
 
         // INSERT: warpgroup::decrease_registers
         if (warpgroup::warpid() == 0){
+            uint32_t k_phase_bits = (1u << NUM_STAGES) - 1u;
+            uint32_t v_phase_bits = (1u << NUM_STAGES) - 1u;
+
             for(int task_iter=0; true; task_iter++){
+                // if (warpgroup::laneid() == 1) printf("task_iter %d\n", task_iter);
                 int4 task_coord = get_task_coord(globals, task_iter, false);
                 // print_coords_debug(task_iter, task_coord);
-                if (task_coord.x == -1) break;
+                if (task_coord.x == -1) {
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: About to break\n", warpgroup::groupid());
+                    break;
+
+                }
+                // if (warpgroup::laneid() == 1) printf("Wg %d: Waiting to o-tile to be flushed\n", warpgroup::groupid());
                 wait(o_tiles_flushed, (task_iter^1)%2);
-                // if (blockIdx.x == 0 && warpgroup::laneid() == 0) printf("Cleared wait on o_tiles_flushed\n");
-                // return
+                // if (warpgroup::laneid() == 1) printf("Wg %d: Cleared wait on o_tiles_flushed\n", warpgroup::groupid());
                 tma::expect(q_tiles_ready, q_smem);
                 for(int cwg = 0; cwg < CONSUMER_WARPGROUPS; cwg++){
                     tma::load_async(q_smem[cwg], globals.q, 
                         kittens::coord<qo_tile>{task_coord.x, task_coord.y, task_coord.z + cwg, task_coord.w}, q_tiles_ready);
                 }
                 int iters_per_task = globals.k.rows() / KV_CHUNK;
+                if constexpr (is_causal){
+                    int cta_max_q_row = (task_coord.z + CONSUMER_WARPGROUPS) * QO_CHUNK;
+                    int cta_causal_limit = (cta_max_q_row + KV_CHUNK - 1) / KV_CHUNK;
+                    iters_per_task = min(iters_per_task,  cta_causal_limit);
+                } 
                 for(int it = 0; it < iters_per_task; it++){
+                    int stage = it % NUM_STAGES;
                     kittens::coord<kv_tile> kv_idx = {task_coord.x, task_coord.y, it, task_coord.w};
-                    // if (blockIdx.x == 0 && warpgroup::laneid() == 0) printf("Coord from KV %d %d %d %d \n", kv_idx.b, kv_idx.d, kv_idx.r, kv_idx.c);
-                    
-                    wait(k_stage_finished[it % NUM_STAGES], ((it / NUM_STAGES) + 1) % 2);
-                    // if (blockIdx.x == 0 && warpgroup::laneid() == 0) printf("Cleared wait on k_stage_finished %d\n", it % NUM_STAGES);
-                    tma::expect(k_stage_arrived[it % NUM_STAGES], k_smem[it % NUM_STAGES]);
-                    tma::load_async(k_smem[it % NUM_STAGES], globals.k, kv_idx, k_stage_arrived[it % NUM_STAGES]);
-                    wait(v_stage_finished[it % NUM_STAGES], ((it / NUM_STAGES) + 1) % 2);
-                    // if (blockIdx.x == 0 && warpgroup::laneid() == 0) printf("Cleared wait on v_stage_finished %d\n", it % NUM_STAGES);
-                    tma::expect(v_stage_arrived[it % NUM_STAGES], v_smem[it % NUM_STAGES]);
-                    tma::load_async(v_smem[it % NUM_STAGES], globals.v, kv_idx, v_stage_arrived[it % NUM_STAGES]);
-                    // if (it == iters_per_task-1) return;
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: Waiting to load k-tile into slot %d on iteration %d\n", warpgroup::groupid(), stage, it);
+                    unsigned k_phase = get_phase_bit(k_phase_bits, stage);
+                    // if (warpgroup::laneid() == 1) printf("K phase bit %d\n", k_phase);
+                    wait(k_stage_finished[stage], k_phase);
+                    update_phase_bit(k_phase_bits, stage);
+                    tma::expect(k_stage_arrived[stage], k_smem[stage]);
+                    tma::load_async(k_smem[stage], globals.k, kv_idx, k_stage_arrived[stage]);
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: Cleared wait to load k-tile into slot + loading... %d on iteration %d\n", warpgroup::groupid(), stage, it);
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: Waiting to load v-tile into slot %d on iteration %d\n", warpgroup::groupid(), stage, it);
+                    unsigned v_phase = get_phase_bit(v_phase_bits, stage);
+                    // if (warpgroup::laneid() == 1) printf("V phase bit %d\n", v_phase);
+                    wait(v_stage_finished[stage], v_phase);
+                    update_phase_bit(v_phase_bits, stage);
+                    tma::expect(v_stage_arrived[stage], v_smem[stage]);
+                    tma::load_async(v_smem[stage], globals.v, kv_idx, v_stage_arrived[stage]);
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: Cleared wait to load v-tile into slot + loading... %d on iteration %d\n", warpgroup::groupid(), stage, it);
                 }
             }
             // Not sure about whether we need to sync all producer threads before continuing with the next task like in H100 matmul.
@@ -139,7 +178,10 @@ void fwd_kernel(const __grid_constant__ fwd_globals<64> globals) {
         rt_fl<16, 64> o_reg; // <- REVISIT: Should be HEAD_DIM cols
 
         col_vec<rt_fl<16, 64>> m_vec, m_vec_old, cf_vec, l_reg;
-        
+
+        uint32_t k_phase_bits = 0u;
+        uint32_t v_phase_bits = 0u;
+
         for(int task_iter=0; true; task_iter++){
             int4 task_coord = get_task_coord(globals, task_iter, true);
             // print_coords_debug(task_iter, task_coord);
@@ -149,46 +191,115 @@ void fwd_kernel(const __grid_constant__ fwd_globals<64> globals) {
             zero(l_reg);
             neg_infty(m_vec);
 
+            // if (warpgroup::laneid() == 1) printf("task_iter %d\n", task_iter);
+            // if (warpgroup::laneid() == 1) printf("Wg %d: Waiting for q-tile %d\n", warpgroup::groupid());
             wait(q_tiles_ready, (task_iter^0)%2);
-            if (blockIdx.x == 0 && warpgroup::groupid() == 0 && warpgroup::laneid() == 0) printf("Task %d. Cleared wait on q_tiles_ready\n", task_iter);
+            // if (warpgroup::laneid() == 1) printf("Wg %d: Q-tile ready for consumption\n", warpgroup::groupid());
             int iters_per_task = globals.k.rows() / KV_CHUNK;
+            int warpgroup_causal_limit = iters_per_task; // REVISIT: Don't like this. Change.
+            int warpgroup_max_q_row = (task_coord.z + warpgroup::groupid() + 1) * QO_CHUNK;
+            warpgroup_causal_limit = (warpgroup_max_q_row + KV_CHUNK - 1) / KV_CHUNK;
+            if constexpr (is_causal){
+                int warpgroup_max_q_row = (task_coord.z + warpgroup::groupid() + 1) * QO_CHUNK;
+                warpgroup_causal_limit = (warpgroup_max_q_row + KV_CHUNK - 1) / KV_CHUNK;
+                int cta_max_q_row = (task_coord.z + CONSUMER_WARPGROUPS) * QO_CHUNK;
+                int cta_causal_limit = (cta_max_q_row + KV_CHUNK - 1) / KV_CHUNK;
+                iters_per_task = min(iters_per_task, cta_causal_limit);
+
+                // for (int i = 0; i < gridDim.x; i++){
+                //     for (int j = 0; j < CONSUMER_WARPGROUPS; j++){
+                //         if (blockIdx.x == i && warpgroup::groupid() == j && warpgroup::laneid() == 0){
+                //             printf(
+                //                 "task_iter %d block_idx %d cwg_idx %d warpgroup_max_q_row %d warpgroup_causal_limit %d cta_max_q_row %d cta_causal_limit %d iters_per_task %d\n",
+                //                 task_iter, i, j, warpgroup_max_q_row, warpgroup_causal_limit, cta_max_q_row, cta_causal_limit, iters_per_task
+                //             );
+                //         }
+                //     }
+                // }
+            }
+            // if (threadIdx.x == DEBUG_CWG_ID*128 + 32) printf("task_iter %d\n", task_iter);
+            // if (threadIdx.x == DEBUG_CWG_ID*128 + 32) printf("q smem\n");
+            // debug_print_tile(DEBUG_BLK_ID, DEBUG_CWG_ID, q_smem[DEBUG_CWG_ID]);
             for(int it = 0; it < iters_per_task; it++){
-                wait(k_stage_arrived[it % NUM_STAGES], (it / NUM_STAGES) % 2);
-                if (blockIdx.x == 0 && warpgroup::groupid() == 0 && warpgroup::laneid() == 0) printf("Task %d. Cleared wait on k_stage_arrived %d\n", task_iter, it);
-                warpgroup::mm_ABt(attn, q_smem[warpgroup::groupid()], k_smem[it % NUM_STAGES]);
-                warpgroup::mma_async_wait();
-                if (warpgroup::laneid() == 0) arrive(k_stage_finished[it % NUM_STAGES]);
-                mul(attn, attn, 0.125f); // <- REVISIT: 0.125f = float(1/sqrt(64))
-                copy(m_vec_old, m_vec);
-                row_max(m_vec, attn, m_vec_old);
-                sub_row(attn, attn, m_vec);
-                exp(attn, attn);
-                sub(cf_vec, m_vec_old, m_vec);
-                exp(cf_vec, cf_vec);
-                mul(l_reg, l_reg, cf_vec);
-                row_sum(l_reg, attn, l_reg);
-                mul_row(o_reg, o_reg, cf_vec);
-                copy(attn_mma, attn);
-                wait(v_stage_arrived[it % NUM_STAGES], (it / NUM_STAGES) % 2);
-                // if (blockIdx.x == 0 && warpgroup::groupid() == 0 && warpgroup::laneid() == 0) printf("Task %d. Cleared wait on v_stage_arrived %d\n", task_iter, it);
-                // if (it == iters_per_task-1) return;
-                warpgroup::mma_AB(o_reg, attn_mma, v_smem[it % NUM_STAGES]);
-                warpgroup::mma_async_wait();
-                if (warpgroup::laneid() == 0) arrive(v_stage_finished[it % NUM_STAGES]);
+                int stage = it % NUM_STAGES;
+                bool participate = (!is_causal || it < warpgroup_causal_limit);
+                if (participate){
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: Waiting for k-tile in slot %d on iteration %d\n", warpgroup::groupid(), stage, it);
+                    unsigned k_phase = get_phase_bit(k_phase_bits, stage);
+                    // if (warpgroup::laneid() == 1) printf("K phase bit %d\n", k_phase);
+                    wait(k_stage_arrived[stage], k_phase);
+                    update_phase_bit(k_phase_bits, stage);
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: K-tile in slot %d ready for consumption on iteration %d\n", warpgroup::groupid(), stage, it);
+                    warpgroup::mm_ABt(attn, q_smem[warpgroup::groupid()], k_smem[stage]);
+                    warpgroup::mma_async_wait();
+                    // if (threadIdx.x == DEBUG_CWG_ID*128 + 32) printf("k smem\n");
+                    // debug_print_tile(DEBUG_BLK_ID, DEBUG_CWG_ID, k_smem[it % NUM_STAGES]);
+                    
+                    warpgroup::store(debug_masking_smem[warpgroup::groupid()], attn);
+                    warpgroup::sync(warpgroup::groupid()+4);
+                    // if (threadIdx.x == DEBUG_CWG_ID*128 + 32) printf("premask attn smem\n");
+                    // debug_print_tile(DEBUG_BLK_ID, DEBUG_CWG_ID, debug_masking_smem[DEBUG_CWG_ID]);
+                    warpgroup::sync(warpgroup::groupid()+4);
+
+
+                }
+                if (warpgroup::laneid() == 0) arrive(k_stage_finished[stage]);
+                // if (warpgroup::laneid() == 1) printf("Wg %d: Arrived on k_stage_finished %d on iteration %d\n", warpgroup::groupid(), stage, it);
+                if (participate){
+                    // Add casual masking here
+                    if constexpr (is_causal){
+                        if (it == (warpgroup_causal_limit - 1)){
+                            const int row_subtile = warpgroup::warpid();
+                            const int attn_width = KV_CHUNK / kittens::TILE_COL_DIM<float>;
+                            for (int col_subtile = 0; col_subtile < attn_width; col_subtile++){
+                                auto &attn_subtile = reinterpret_cast<rt_fl<16, kittens::TILE_COL_DIM<float>>&>(attn.tiles[0][col_subtile]);
+                                if (row_subtile == col_subtile){ make_causal(attn_subtile, attn_subtile, kittens::base_types::constants<float>::neg_infty()); }
+                                else if (row_subtile < col_subtile) { neg_infty(attn_subtile); }
+                            }
+                        }
+                    }
+                    // warpgroup::store(debug_masking_smem[warpgroup::groupid()], attn);
+                    // warpgroup::sync(warpgroup::groupid()+4);
+                    // debug_print_tile(DEBUG_BLK_ID, DEBUG_CWG_ID, debug_masking_smem[DEBUG_CWG_ID]);
+                    mul(attn, attn, 0.125f); // <- REVISIT: 0.125f = float(1/sqrt(64))
+                    copy(m_vec_old, m_vec);
+                    row_max(m_vec, attn, m_vec_old);
+                    sub_row(attn, attn, m_vec);
+                    exp(attn, attn);
+                    sub(cf_vec, m_vec_old, m_vec);
+                    exp(cf_vec, cf_vec);
+                    mul(l_reg, l_reg, cf_vec);
+                    row_sum(l_reg, attn, l_reg);
+                    mul_row(o_reg, o_reg, cf_vec);
+                    copy(attn_mma, attn);
+                
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: Waiting for v-tile in slot %d on iteration %d\n", warpgroup::groupid(), stage, it);
+                    unsigned v_phase = get_phase_bit(v_phase_bits, stage);
+                    // if (warpgroup::laneid() == 1) printf("V phase bit %d\n", v_phase);
+                    wait(v_stage_arrived[stage], v_phase);
+                    // if (warpgroup::laneid() == 1) printf("Wg %d: V-tile in slot %d ready for consumption on iteration %d\n", warpgroup::groupid(), stage, it);
+                    update_phase_bit(v_phase_bits, stage);
+                    warpgroup::mma_AB(o_reg, attn_mma, v_smem[stage]);
+                    warpgroup::mma_async_wait();
+                }
+                if (warpgroup::laneid() == 0) arrive(v_stage_finished[stage]);
+                // if (warpgroup::laneid() == 1) printf("Wg %d: Arrived on v_stage_finished %d on iteration %d\n", warpgroup::groupid(), stage, it);
             }
             // Not sure about whether we need to sync all consumer threads before doing stores like in H100 matmul.
             div_row(o_reg, o_reg, l_reg);
             warpgroup::store(o_smem[warpgroup::groupid()], o_reg);
             warpgroup::sync(warpgroup::groupid()+4); // REVISIT: Why do we need this?
-            if (warpgroup::warpid() == 0) tma::store_async(globals.o, o_smem[warpgroup::groupid()], kittens::coord<qo_tile>(task_coord));
+            // debug_print_tile(DEBUG_BLK_ID, DEBUG_CWG_ID, o_smem[DEBUG_CWG_ID]);
+            if (warpgroup::warpid() == 0) tma::store_async(globals.o, o_smem[warpgroup::groupid()], kittens::coord<qo_tile>({task_coord.x, task_coord.y, task_coord.z+warpgroup::groupid(), task_coord.w}));
             log(l_reg, l_reg);
             add(l_reg, l_reg, m_vec);
             warpgroup::store(l_smem[warpgroup::groupid()], l_reg);
             warpgroup::sync(warpgroup::groupid()+4); // REVISIT: Why do we need this?
             // l has different coords system has o (remember batch, head, 1, seq vs batch, head, seq, head_dim)
-            if (warpgroup::warpid() == 0) tma::store_async(globals.l, l_smem[warpgroup::groupid()], kittens::coord<l_vec>({task_coord.x, task_coord.y, task_coord.w, task_coord.z}));
-             tma::store_async_read_wait();
+            if (warpgroup::warpid() == 0) tma::store_async(globals.l, l_smem[warpgroup::groupid()], kittens::coord<l_vec>({task_coord.x, task_coord.y, task_coord.w, task_coord.z+warpgroup::groupid()}));
+            tma::store_async_read_wait();
             if (warpgroup::laneid() == 0) arrive(o_tiles_flushed);
+            // if (warpgroup::laneid() == 1) printf("Wg %d: Arrived on o_tiles_flushed\n", warpgroup::groupid());
             // Not sure about whether we need to sync all consumer threads before continuing with the next task like in H100 matmul.
             // I think we might just for semantics but not for correctness. The concern is that without the sync, the threads which didn't
             // do tma::store_async will race ahead but thread 0 is still blocked by tma::store_async_read_wait(); and thus won't arrive(o_tiles_flushed);

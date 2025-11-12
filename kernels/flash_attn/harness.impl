@@ -3,10 +3,12 @@
 #include <iomanip>
 
 
-constexpr int BATCH_SIZE = 12;
-constexpr int N_HEADS = 12;
-constexpr int SEQ_LEN = 1024;
+constexpr int BATCH_SIZE = 1;
+constexpr int N_HEADS = 1;
+constexpr int SEQ_LEN = 256;
 constexpr int HEAD_DIM = 64;
+
+constexpr bool causal = true; 
 
 void check_correctness(const float *computed, const float *reference, int num_elements, const char *name){
     float max_error = 0.0f;
@@ -94,13 +96,13 @@ fwd_globals<64> globals{
     {d_l, static_cast<unsigned int>(BATCH_SIZE), static_cast<unsigned int>(N_HEADS), nullptr, static_cast<unsigned int>(SEQ_LEN)}
 };
 
-dim3 grid(114);
+dim3 grid(1);
 dim3 block(NUM_WARPGROUPS*WARPGROUP_THREADS);
 
 unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
-cudaFuncSetAttribute(fwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+cudaFuncSetAttribute(fwd_kernel<causal>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
 
-fwd_kernel<<<grid, block, mem_size>>>(globals);
+fwd_kernel<causal><<<grid, block, mem_size>>>(globals);
 
 __nv_bfloat16 *h_o_bf = new __nv_bfloat16[TOTAL_ELEMENTS];
 cudaMemcpy(h_o_bf, d_o, TOTAL_ELEMENTS * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);

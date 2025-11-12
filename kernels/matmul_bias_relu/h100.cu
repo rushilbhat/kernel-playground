@@ -176,9 +176,8 @@ torch::Tensor matmul_bias_relu(torch::Tensor A, torch::Tensor B, torch::Tensor b
     // cudaDeviceSynchronize();
     return C;
 }
-#endif
 
-#ifdef STANDALONE_COMPILE
+#else
 constexpr bool NCU = false;
 #include <iostream>
 #include <random>

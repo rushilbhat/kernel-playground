@@ -1,3 +1,4 @@
 kernels = [
-    'matmul_bias_relu',
+    # 'matmul_bias_relu',
+    'flash_attn'
 ]
